@@ -29,20 +29,22 @@ Analyze the user prompt and generate an ordered JSON execution plan using availa
 - "doc_write": Generate final Word, Excel, or approval reports.
 
 Rules:
-1. If the user prompt is completely unclear, nonsensical, or cannot be mapped to any task, return {"plan": []}.
+1. If the user prompt is completely unclear, nonsensical (e.g., random keyboard mashing like "asdfg"), or cannot be mapped to any task, return {"plan": []}.
 2. Otherwise, return ONLY valid JSON matching this schema:
 {"plan": ["node_1", "node_2"]}
 """
 
 def generate_plan(user_prompt: str, file_path: Optional[str] = None) -> List[str]:
-    # Immediately catch empty or meaningless short inputs
-    if not user_prompt or len(user_prompt.strip()) < 10:
+    # Fix 2 & 3: Check for genuine content and evaluate file_path strictly
+    has_file = bool(file_path and file_path.strip())
+    
+    if not user_prompt or len(user_prompt.strip()) < 3:
         return []
 
     try:
         response = llm.invoke([
             SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-            HumanMessage(content=f"User Task: {user_prompt}\nFile Attached: {file_path is not None}")
+            HumanMessage(content=f"User Task: {user_prompt}\nFile Attached: {has_file}")
         ])
         content = str(response.content).strip()
         if "```" in content:
@@ -52,7 +54,7 @@ def generate_plan(user_prompt: str, file_path: Optional[str] = None) -> List[str
         plan = data.get("plan", [])
         return plan if isinstance(plan, list) else []
     except Exception:
-        # If model is offline, only provide a fallback if the prompt is an actual task description
-        if len(user_prompt.strip()) < 15:
+        # Fallback only when prompt resembles an actual sentence/command
+        if len(user_prompt.strip()) < 8:
             return []
-        return ["doc_read", "rag_search", "coding_agent", "doc_write"] if file_path else ["rag_search", "coding_agent", "doc_write"]
+        return ["doc_read", "rag_search", "coding_agent", "doc_write"] if has_file else ["rag_search", "coding_agent", "doc_write"]

@@ -1,4 +1,5 @@
 import asyncio
+import re
 from typing import Any, List
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt, Command
@@ -13,12 +14,10 @@ from planner import generate_plan, build_step_models
 # 1. CORE ORCHESTRATOR & DISPATCHER
 # ==========================================
 async def orchestrator_node(state: AgentState) -> dict:
-    """Tracks plan generation, model assignment, and advances step indices."""
     prompt = state.get("user_prompt", "")
     file_path = state.get("file_path")
     plan = state.get("execution_plan")
 
-    # Initialization Phase (First run)
     if plan is None:
         plan = generate_plan(prompt, file_path)
         step_models = build_step_models(plan)
@@ -33,7 +32,6 @@ async def orchestrator_node(state: AgentState) -> dict:
             "execution_history": [{"node": "orchestrator", "status": "planned", "plan": plan, "step_models": step_models}]
         }
 
-    # Advance to next step in the sequence
     new_idx = state.get("current_step_index", 0) + 1
     return {
         "current_step_index": new_idx,
@@ -76,12 +74,17 @@ async def coding_agent_node(state: AgentState) -> dict:
     model_name = state.get("step_models", {}).get("coding_agent", "qwen2.5-coder:7b")
     print(f"--> [Member 5: Coding Agent] Using model [{model_name}] to generate verification script...")
 
-    context = state.get("extracted_text") or "No extracted data provided."
-    sop = state.get("retrieved_sop_context") or "No SOP context provided."
+    context = state.get("extracted_text") or ""
+    sop = state.get("retrieved_sop_context") or ""
     feedback = state.get("review_feedback") or ""
 
+    # Fix 1: Dynamic fallback calculation derived from context if LLM is offline
+    val_match = re.findall(r"(\d+(?:\.\d+)?)", context)
+    thickness = float(val_match[0]) if val_match else 12.4
+    min_req = 10.0
+    
     fallback_code = (
-        "thickness = 12.4\nmin_req = 10.0\n"
+        f"thickness = {thickness}\nmin_req = {min_req}\n"
         "safety_factor = thickness / min_req\n"
         "print(f'Safety Factor: {safety_factor:.2f}')"
     )
@@ -165,7 +168,6 @@ async def guardrails_node(state: AgentState) -> dict:
     }
 
 async def human_approval_node(state: AgentState) -> dict:
-    """Pauses execution for human intervention."""
     artifact = state.get("generated_artifact_path", "No artifact generated")
 
     decision = interrupt({
@@ -189,7 +191,6 @@ def dispatch_next_step(state: AgentState) -> str:
     plan = state.get("execution_plan", [])
     idx = state.get("current_step_index", 0)
 
-    # Empty plan routes directly to clarification
     if not plan:
         return "clarification_node"
 
@@ -213,7 +214,6 @@ def route_coding_loop(state: AgentState) -> str:
 # ==========================================
 builder = StateGraph(AgentState)
 
-# Nodes
 builder.add_node("orchestrator", orchestrator_node)
 builder.add_node("clarification_node", clarification_node)
 builder.add_node("doc_read", doc_read_node)
@@ -226,7 +226,6 @@ builder.add_node("output_validator", output_validator_node)
 builder.add_node("guardrails_check", guardrails_node)
 builder.add_node("human_approval", human_approval_node)
 
-# Flow Connections
 builder.add_edge(START, "orchestrator")
 
 builder.add_conditional_edges(
@@ -246,7 +245,6 @@ builder.add_edge("clarification_node", END)
 builder.add_edge("doc_read", "orchestrator")
 builder.add_edge("rag_search", "orchestrator")
 
-# Member 5 Sub-Loop
 builder.add_edge("coding_agent", "code_test_agent")
 builder.add_edge("code_test_agent", "code_review_agent")
 builder.add_conditional_edges(
@@ -259,7 +257,6 @@ builder.add_conditional_edges(
     }
 )
 
-# Member 6 Final Pipeline
 builder.add_edge("doc_write", "output_validator")
 builder.add_edge("output_validator", "guardrails_check")
 builder.add_edge("guardrails_check", "human_approval")
@@ -274,10 +271,9 @@ app = builder.compile(checkpointer=checkpointer)
 async def main():
     config = {"configurable": {"thread_id": "session-1"}}
 
-    # Example test prompt (change to "asdfg" to test clarification exit)
     initial_input: AgentState = {
-        "user_prompt": "Read the file and make report",
-        "file_path": None,
+        "user_prompt": "Read the inspection report, check SOP safety standards, verify math, and generate approval note.",
+        "file_path": "uploads/inspection_report.pdf",
         "retry_count": 0,
         "execution_history": []
     }
@@ -285,13 +281,19 @@ async def main():
     print("\n=== STARTING ORCHESTRATION PIPELINE ===")
     result = await app.ainvoke(initial_input, config=config)
 
-    # Pause handler for human review
+    # Fix 4: Continuous clarification loop for human review typos
     while "__interrupt__" in result:
         payload = result["__interrupt__"][0].value
         print(f"\n[HUMAN REVIEW] {payload['message']}")
         print(f"Artifact: {payload['artifact']}")
         print(f"Validation: {payload['validation_status']} | Guardrails: {payload['guardrails_passed']}")
-        answer = input("Approve this output? (yes/no): ")
+        
+        while True:
+            answer = input("Approve this output? (yes/no): ").strip().lower()
+            if answer in ("yes", "y", "no", "n"):
+                break
+            print("Invalid response. Please type 'yes' or 'no'.")
+
         result = await app.ainvoke(Command(resume=answer), config=config)
 
     print("\n=== FINAL DELIVERABLE SUMMARY ===")
