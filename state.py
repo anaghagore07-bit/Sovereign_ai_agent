@@ -1,29 +1,45 @@
-from typing import TypedDict, Optional, Literal, Dict, Any, List
+from typing import TypedDict, List, Dict, Any, Optional, Annotated
+import operator
 
 class AgentState(TypedDict, total=False):
-    # Core User Input & Planning
+    # Member 1: Watchman
+    file_path: Optional[str]
+    file_type: Optional[str]
+    task_type: Optional[str]
     user_prompt: str
-    attached_files: List[str]
-    plan: List[str]
+
+    # Member 2: Orchestrator / Planner
+    execution_plan: List[str]
     current_step_index: int
-    selected_route: Optional[str]
-    
-    # Member 3: Document Reading / OCR / Vision
-    extracted_data: Optional[str]
-    extracted_doc_data: Optional[Dict[str, Any]]
-    
-    # Member 4: RAG & SOP Knowledge
-    sop_rules: Optional[str]
+    # Which local model was auto-selected for each step, e.g. {"coding_agent": "qwen2.5-coder:7b"}
+    step_models: Dict[str, str]
+    # Reducer preserves full audit trail across all nodes rather than overwriting
+    execution_history: Annotated[List[Dict[str, Any]], operator.add]
+    model_name: str
+    error_message: Optional[str]
+
+    # Member 3: Document Reading & Multimodal
+    extracted_text: Optional[str]
+    extracted_tables: Optional[List[Dict[str, Any]]]
+    extracted_images_summary: Optional[str]
+    is_scanned: bool
+
+    # Member 4: RAG Knowledge Base
     retrieved_sop_context: Optional[str]
-    
-    # Member 5: Coding & Sandbox Verification
+    # Reducer accumulates citations from multiple queries
+    sop_citations: Annotated[List[str], operator.add]
+
+    # Member 5: Coding & Testing Sandbox
     generated_code: Optional[str]
-    code_results: Optional[str]
-    test_status: Literal["pass", "fail", "not_run"]
+    execution_output: Optional[str]
+    execution_error: Optional[str]
+    test_passed: bool
+    review_feedback: Optional[str]
     retry_count: int
-    error_log: Optional[str]
-    
-    # Member 6: Output & Artifact Generation
-    generated_artifact: Optional[str]
-    final_output: Optional[str]
-    artifact_path: Optional[str]
+
+    # Member 6: Output, Validation & Guardrails
+    generated_artifact_path: Optional[str]
+    validation_status: str          # "passed", "failed"
+    validation_errors: List[str]
+    guardrails_passed: bool
+    human_approved: Optional[bool]
