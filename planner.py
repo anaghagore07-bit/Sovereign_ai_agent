@@ -35,8 +35,8 @@ Rules:
 """
 
 def generate_plan(user_prompt: str, file_path: Optional[str] = None) -> List[str]:
-    # Quick sanity check for empty or trivial inputs
-    if not user_prompt or len(user_prompt.strip()) < 4:
+    # Immediately catch empty or meaningless short inputs
+    if not user_prompt or len(user_prompt.strip()) < 10:
         return []
 
     try:
@@ -52,5 +52,7 @@ def generate_plan(user_prompt: str, file_path: Optional[str] = None) -> List[str
         plan = data.get("plan", [])
         return plan if isinstance(plan, list) else []
     except Exception:
-        # If model is offline but input has reasonable length, provide a standard fallback
+        # If model is offline, only provide a fallback if the prompt is an actual task description
+        if len(user_prompt.strip()) < 15:
+            return []
         return ["doc_read", "rag_search", "coding_agent", "doc_write"] if file_path else ["rag_search", "coding_agent", "doc_write"]

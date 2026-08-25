@@ -276,8 +276,8 @@ async def main():
 
     # Example test prompt (change to "asdfg" to test clarification exit)
     initial_input: AgentState = {
-        "user_prompt": "Read the inspection report, check SOP safety standards, verify math, and generate approval note.",
-        "file_path": "uploads/inspection_report.pdf",
+        "user_prompt": "Read the file and make report",
+        "file_path": None,
         "retry_count": 0,
         "execution_history": []
     }
