@@ -1,5 +1,4 @@
 import os
-import re
 import json
 from typing import Optional, List, Dict
 from langchain_ollama import ChatOllama
@@ -8,92 +7,137 @@ from langchain_core.messages import HumanMessage, SystemMessage
 ROUTER_MODEL = os.getenv("ROUTER_MODEL", "llama3.1:8b")
 router_llm = ChatOllama(model=ROUTER_MODEL, temperature=0)
 
+# ---------------------------------------------------------------------------
+# Model auto-selection
+# ---------------------------------------------------------------------------
+# Which local model handles each concrete node/engine in the graph. This is
+# now actually consumed by graph.py's orchestrator_node and doc_read_node —
+# in the first draft this map existed but nothing ever called it.
 STEP_MODEL_MAP: Dict[str, str] = {
-    "doc_read": os.getenv("VISION_MODEL", "llava"),
-    "rag_search": os.getenv("RAG_MODEL", "llama3.1:8b"),
+    "ocr": os.getenv("VISION_MODEL", "llava"),
+    "vision": os.getenv("VISION_MODEL", "llava"),
+    "rag": os.getenv("ROUTER_MODEL", "llama3.1:8b"),
     "coding_agent": os.getenv("CODING_MODEL", "qwen2.5-coder:7b"),
-    "doc_write": os.getenv("DOC_MODEL", "llama3.1:8b"),
+    "code_review_agent": os.getenv("CODING_MODEL", "qwen2.5-coder:7b"),
+    "doc_write": os.getenv("ROUTER_MODEL", "llama3.1:8b"),
 }
+DEFAULT_MODEL = ROUTER_MODEL
+
 
 def get_model_for_step(step_name: str) -> str:
-    return STEP_MODEL_MAP.get(step_name, ROUTER_MODEL)
+    """Return the local model assigned to a given node/engine name."""
+    return STEP_MODEL_MAP.get(step_name, DEFAULT_MODEL)
 
-def build_step_models(plan: List[str]) -> Dict[str, str]:
-    return {step: get_model_for_step(step) for step in plan}
 
-# --- LEVEL 1: REGEX DETERMINISTIC PARSER (<1ms) ---
-def level_1_regex_planner(prompt: str, has_file: bool) -> Optional[List[str]]:
-    text = (prompt or "").strip().lower()
+def build_step_models(steps: List[str]) -> Dict[str, str]:
+    """Given a list of node/engine names, return {step: model}."""
+    return {step: get_model_for_step(step) for step in steps}
 
-    # Reject obvious gibberish or empty prompts
-    if not text or len(text) < 3 or re.fullmatch(r"[^a-zA-Z0-9\s]+", text):
-        return []
-    if re.fullmatch(r"(.)\1{3,}", text) or text in ["asdf", "asdfg", "asdfgh", "qwerty", "zxcv"]:
-        return []
 
-    plan: List[str] = []
-    
-    # 1. Check document ingestion requirement
-    if has_file or re.search(r"\b(read|parse|extract|scan|image|pdf|drawing|blueprint|ocr|vision)\b", text):
-        plan.append("doc_read")
-
-    # 2. Check enterprise RAG lookup
-    if re.search(r"\b(sop|standard|guideline|manual|policy|compliance|clause|rag)\b", text):
-        plan.append("rag_search")
-
-    # 3. Check math / coding verification
-    if re.search(r"\b(calculate|verify|math|safety factor|formula|compute|code|script)\b", text):
-        plan.append("coding_agent")
-
-    # 4. Check report/writing requirement
-    if re.search(r"\b(report|write|summary|document|note|dossier|draft|approval|export|essay)\b", text):
-        plan.append("doc_write")
-
-    # If Regex identified multiple structured steps or explicit doc_write
-    if len(plan) >= 2 or (len(plan) == 1 and plan[0] == "doc_write"):
-        print("--> [Planner Tier 1] Plan resolved via Regex pattern matching.")
-        return plan
-
-    return None
-
-# --- LEVEL 2: LLM SEMANTIC STEP DECOMPOSER ---
+# ---------------------------------------------------------------------------
+# Tier 2: semantic router (used when Tier 1 regex in graph.py is ambiguous)
+# ---------------------------------------------------------------------------
 PLANNER_SYSTEM_PROMPT = """
 You are the central Orchestrator Brain for a Sovereign AI system.
-Break down the user task into an ordered JSON list of execution steps from these worker nodes:
-- "doc_read": Document text, image, or blueprint parsing.
-- "rag_search": Query company SOPs, manuals, or engineering standards.
-- "coding_agent": Run calculations, write/execute Python code in a sandbox.
-- "doc_write": Generate final Word, Excel, or approval notes.
+Classify the user task into exactly ONE operational route:
+- "coding": Calculation, script execution, numerical verification, math checks.
+- "doc_read": Needs OCR/text extraction, visual diagram reading, or SOP/manual search.
+- "doc_write": Direct report/note generation with no extraction step needed first.
+- "clarification": Unclear, nonsensical (e.g. random keyboard mashing), or unmappable.
 
 Rules:
-1. If the prompt is unclear or nonsensical, return {"plan": []}.
-2. Return ONLY valid JSON: {"plan": ["step1", "step2"]}
+1. If the prompt is nonsensical or cannot be mapped to a task, return {"route": "clarification"}.
+2. Otherwise return ONLY valid JSON matching this schema, nothing else:
+{"route": "coding" | "doc_read" | "doc_write" | "clarification"}
+No preamble, no markdown fences, no explanation.
 """
 
-def generate_execution_plan(user_prompt: str, file_path: Optional[str] = None) -> List[str]:
-    has_file = bool(file_path and file_path.strip())
 
-    # Level 1 Check
-    quick_plan = level_1_regex_planner(user_prompt, has_file)
-    if quick_plan is not None:
-        return quick_plan
-
-    # Level 2 Fallback
-    print("--> [Planner Tier 2] Conversational prompt. Delegating to LLM semantic planner...")
+def level_2_llm_router(prompt: str, has_file: bool) -> str:
+    """Semantic fallback classifier for prompts the Tier-1 regex can't resolve."""
     try:
         response = router_llm.invoke([
             SystemMessage(content=PLANNER_SYSTEM_PROMPT),
-            HumanMessage(content=f"User Task: {user_prompt}\nFile Attached: {has_file}")
+            HumanMessage(content=f"User Task: {prompt}\nFile Attached: {has_file}")
         ])
         content = str(response.content).strip()
-        if "```json" in content:
+        if "```" in content:
             content = content.split("```json")[-1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].strip()
-
         data = json.loads(content)
-        plan = data.get("plan", [])
-        return plan if isinstance(plan, list) else []
+        route = data.get("route")
+        if route not in ("coding", "doc_read", "doc_write", "clarification"):
+            return "clarification"
+        return route
     except Exception:
-        # Default to clarification if unrecognized to prevent wrong outputs
+        # Fail loud: an unrouteable request should ask for clarification,
+        # not silently masquerade as a doc_write task.
+        return "clarification"
+
+
+# ---------------------------------------------------------------------------
+# Step decomposition — this is the piece that was previously dead code
+# ---------------------------------------------------------------------------
+def build_execution_plan(route: str, prompt: str) -> List[str]:
+    """
+    Turn a single route into an ordered list of graph stages. Every
+    non-clarification route ends in doc_write, because doc_write is the
+    mandatory final composition stage before validation/guardrails/artifact
+    generation in this architecture (see the pipeline diagram).
+    """
+    if route == "clarification":
         return []
+
+    prompt_l = (prompt or "").lower()
+    wants_coding = any(k in prompt_l for k in (
+        "code", "calculate", "calculation", "math", "verify", "script",
+        "compute", "factor", "equation", "check the numbers"
+    ))
+
+    if route == "coding":
+        return ["coding_agent", "doc_write"]
+
+    if route == "doc_read":
+        plan = ["doc_read"]
+        if wants_coding:
+            plan.append("coding_agent")
+        plan.append("doc_write")
+        return plan
+
+    # route == "doc_write" or any unexpected value
+    return ["doc_write"]
+
+
+def determine_sub_engines(prompt: str, file_path: Optional[str]) -> List[str]:
+    """
+    Decide which ingestion engine(s) doc_read needs to run, in order.
+    A single request can legitimately need more than one engine (e.g. a
+    scanned inspection sheet that also needs an SOP lookup) — the first
+    draft's doc_read could only ever branch to exactly one engine.
+    """
+    prompt_l = (prompt or "").lower()
+    path_l = (file_path or "").lower()
+    has_file = bool(file_path and file_path.strip())
+
+    is_image = path_l.endswith((".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif"))
+    wants_vision = is_image or any(
+        k in prompt_l for k in ("image", "drawing", "diagram", "schematic", "photograph", "photo")
+    )
+    wants_rag = any(k in prompt_l for k in ("sop", "standard", "manual", "clause", "policy", "regulation"))
+    explicit_scan = any(k in prompt_l for k in ("scan", "ocr", "handwritten"))
+    wants_ocr = (has_file and not is_image) or explicit_scan
+
+    engines: List[str] = []
+    if wants_vision:
+        engines.append("vision")
+    if wants_ocr and "ocr" not in engines:
+        engines.append("ocr")
+    if wants_rag:
+        engines.append("rag")
+
+    if not engines:
+        # Something triggered doc_read (a file, or a "read/extract" style
+        # prompt) but nothing more specific matched — default to OCR/text
+        # extraction rather than silently doing nothing.
+        engines.append("ocr")
+
+    return engines
